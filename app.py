@@ -1,392 +1,280 @@
-"""
-Screener Dinâmico de Ações (B3, BDRs e EUA)
--------------------------------------------
-- Filtros 100% ajustáveis pelo usuário (aba "Configuração de Critérios").
-- Dados: Brapi.dev (B3/BDRs) e yfinance (EUA e fallback).
-- Pontuação: Ouro / Prata / Bronze / Descartadas, recalculada em tempo real.
+"""Screener Dinâmico de Ações da B3 — filtros móveis, 4 fontes e verificação cruzada.
 
 Executar:  streamlit run app.py
 """
-
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
 
 import pandas as pd
-import requests
 import streamlit as st
 
-st.set_page_config(page_title="Screener Dinâmico de Ações", page_icon="📈", layout="wide")
+from scoring import (CAT_ICON, CATEGORIES, CRITERIA, OP, PRESETS, VOL_OPTIONS, agreement,
+                     score_universe, threshold)
+from sources import SOURCES, enrich, fetch_fundamentus, fetch_statusinvest
 
-# ----------------------------------------------------------------------------
-# 1. CONFIGURAÇÃO DOS CRITÉRIOS (valores padrão pedidos)
-# ----------------------------------------------------------------------------
-# kind: "num" (número puro) | "pct" (usuário digita em %, comparação em fração)
-#       | "int" (inteiro) | "bool" (checkbox Sim/Não)
-CRITERIA = [
-    dict(key="pl",  label="P/L máximo",                 col="P/L",           op="<",  default=10.0,    kind="num", step=0.5),
-    dict(key="pvp", label="P/VP máximo",                col="P/VP",          op="<",  default=1.0,     kind="num", step=0.1),
-    dict(key="dy",  label="Dividend Yield mínimo (%)",  col="DY",            op=">=", default=10.0,    kind="pct", step=0.5),
-    dict(key="vol", label="Volume diário mínimo",       col="Volume (R$)",   op=">",  default=500000,  kind="int", step=50000),
-    dict(key="mb",  label="Margem bruta mínima (%)",    col="Margem Bruta",  op=">=", default=30.0,    kind="pct", step=1.0),
-    dict(key="ml",  label="Margem líquida mínima (%)",  col="Margem Líquida", op=">=", default=15.0,   kind="pct", step=1.0),
-    dict(key="roe", label="ROE mínimo (%)",             col="ROE",           op=">=", default=10.0,    kind="pct", step=1.0),
-    dict(key="liq", label="Liquidez imediata mínima",   col="Liquidez",      op=">",  default=0.70,    kind="num", step=0.05),
-    dict(key="dl",  label="Dívida líquida / PL máxima", col="DL/PL",         op="<=", default=0.40,    kind="num", step=0.05),
-    dict(key="fcl", label="Fluxo de caixa livre positivo", col="FCL",        op=">",  default=True,    kind="bool", step=None),
-]
-OP_SYMBOL = {"<": "<", "<=": "≤", ">": ">", ">=": "≥"}
-PCT_COLS = ["DY", "Margem Bruta", "Margem Líquida", "ROE"]
+st.set_page_config(page_title="Screener B3", page_icon="📈", layout="wide")
 
-DEFAULT_UNIVERSES = {
-    "B3 (Brapi)": "BBAS3, BBSE3, ITSA4, ITUB4, BBDC4, SANB11, CXSE3, PETR4, PRIO3, VBBR3, UGPA3, VALE3, CMIN3, "
-                  "SUZB3, KLBN11, GGBR4, CSNA3, USIM5, BRAP4, TAEE11, TRPL4, ALUP11, CMIG4, CPLE6, EGIE3, "
-                  "CPFE3, SAPR11, CSMG3, VIVT3, TIMS3, ABEV3, B3SA3, WEGE3, RADL3, LREN3, MGLU3, RENT3, "
-                  "RAIL3, MULT3, CYRE3, SLCE3, SMTO3, AGRO3, HYPE3, FLRY3, BRSR6, TGMA3, BRKM5",
-    "BDRs (Brapi)": "AAPL34, MSFT34, AMZO34, GOGL34, COCA34, JNJB34, PGCO34, XOMP34, DISB34, NFLX34",
-    "EUA (yfinance)": "AAPL, MSFT, KO, PEP, JNJ, PG, XOM, CVX, T, VZ, MO, PM, ABBV, MRK, PFE, IBM, INTC, CSCO, "
-                      "JPM, BAC, WFC, C, MMM, CAT, HD, WMT, MCD, UPS",
-}
-
-# ----------------------------------------------------------------------------
-# 2. COLETA DE DADOS
-# ----------------------------------------------------------------------------
-def num(x):
-    """Converte para float; devolve None se vazio/inválido/NaN."""
-    if isinstance(x, dict):
-        x = x.get("raw")
-    try:
-        if x is None:
-            return None
-        v = float(x)
-        return None if v != v else v
-    except (TypeError, ValueError):
-        return None
+CSS = {"ok": "background-color: rgba(46,160,67,.38)", "fail": "background-color: rgba(218,54,51,.38)",
+       "div": "background-color: rgba(210,153,34,.45)", "nd": "background-color: rgba(128,128,128,.22)"}
+ICON = {"ok": "✓", "fail": "✗", "div": "⚠", "nd": "—"}
+LABEL = {"ok": "✓ Passou", "fail": "✗ Falhou", "div": "⚠ Fontes divergem", "nd": "— Sem dado"}
+METRIC_NAME = {c["key"]: c["short"] for c in CRITERIA}
 
 
-def pick(d, *keys):
-    """Primeiro valor numérico disponível entre várias chaves possíveis."""
-    if not isinstance(d, dict):
-        return None
-    for k in keys:
-        v = num(d.get(k))
-        if v is not None:
-            return v
-    return None
+# ------------------------------------------------------------------ formatação
+def money(v):
+    for lim, suf in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
+        if abs(v) >= lim:
+            return f"{v / lim:.1f}{suf}"
+    return f"{v:.0f}"
 
 
-def finalize(ticker, name, price, pl, pvp, dy, vol, mb, ml, roe, liq, total_debt, total_cash,
-             mcap, de_ratio, fcf, currency):
-    """Monta a linha padronizada (todas as fontes passam por aqui)."""
-    equity = mcap / pvp if (mcap and pvp and pvp > 0) else None
-    dl = None
-    if total_debt is not None and total_cash is not None and equity and equity > 0:
-        dl = (total_debt - total_cash) / equity
-    elif de_ratio is not None:  # fallback: dívida bruta / PL (mais conservador)
-        dl = de_ratio
-    return {
-        "Ticker": ticker, "Empresa": name or ticker, "Preço": price, "Moeda": currency,
-        "P/L": pl, "P/VP": pvp, "DY": dy,
-        "Volume (ações)": vol,
-        "Volume (R$)": vol * price if (vol is not None and price) else None,
-        "Margem Bruta": mb, "Margem Líquida": ml, "ROE": roe,
-        "Liquidez": liq, "DL/PL": dl, "FCL": fcf,
-    }
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_brapi(ticker: str, token: str):
-    url = f"https://brapi.dev/api/quote/{ticker}"
-    params = {"fundamental": "true", "dividends": "true",
-              "modules": "financialData,defaultKeyStatistics,summaryDetail"}
-    if token:
-        params["token"] = token
-    r = requests.get(url, params=params, timeout=25)
-    if r.status_code in (400, 402, 403):  # plano sem acesso aos módulos extras
-        params.pop("modules"), params.pop("dividends")
-        r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    res = r.json()["results"][0]
-
-    fd, ks, sd = (res.get(k) or {} for k in ("financialData", "defaultKeyStatistics", "summaryDetail"))
-    price = pick(res, "regularMarketPrice")
-    pl = pick(res, "priceEarnings") or pick(sd, "trailingPE")
-    pvp = pick(ks, "priceToBook")
-    book = pick(ks, "bookValue")
-    if pvp is None and book and price:
-        pvp = price / book
-
-    # DY = proventos pagos nos últimos 12 meses / preço
-    dy = None
-    cash = (res.get("dividendsData") or {}).get("cashDividends") or []
-    if cash and price:
-        cutoff = (datetime.utcnow() - timedelta(days=365)).strftime("%Y-%m-%d")
-        total = sum(num(d.get("rate")) or 0 for d in cash
-                    if str(d.get("paymentDate") or d.get("lastDatePrior") or "")[:10] >= cutoff)
-        dy = total / price
-    if dy is None:
-        dy = pick(sd, "trailingAnnualDividendYield", "dividendYield")
-
-    de = pick(fd, "debtToEquity")
-    return finalize(
-        ticker, res.get("shortName") or res.get("longName"), price, pl, pvp, dy,
-        pick(res, "averageDailyVolume3Month", "regularMarketVolume"),
-        pick(fd, "grossMargins"), pick(fd, "profitMargins"), pick(fd, "returnOnEquity"),
-        pick(fd, "quickRatio", "currentRatio"),
-        pick(fd, "totalDebt"), pick(fd, "totalCash"), pick(res, "marketCap"),
-        de / 100 if de is not None else None, pick(fd, "freeCashflow"),
-        res.get("currency") or "BRL",
-    )
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_yf(ticker: str):
-    import yfinance as yf
-    info = yf.Ticker(ticker).info or {}
-    if not info or not (info.get("currentPrice") or info.get("regularMarketPrice")):
-        raise ValueError("sem dados no yfinance")
-    price = pick(info, "currentPrice", "regularMarketPrice")
-    dy = None
-    rate = pick(info, "trailingAnnualDividendRate")
-    if rate is not None and price:
-        dy = rate / price
-    if dy is None:
-        dy = pick(info, "trailingAnnualDividendYield")
-    de = pick(info, "debtToEquity")
-    return finalize(
-        ticker.replace(".SA", ""), info.get("shortName") or info.get("longName"), price,
-        pick(info, "trailingPE"), pick(info, "priceToBook"), dy, pick(info, "averageVolume"),
-        pick(info, "grossMargins"), pick(info, "profitMargins"), pick(info, "returnOnEquity"),
-        pick(info, "quickRatio", "currentRatio"),
-        pick(info, "totalDebt"), pick(info, "totalCash"), pick(info, "marketCap"),
-        de / 100 if de is not None else None, pick(info, "freeCashflow"),
-        info.get("currency") or "USD",
-    )
-
-
-def load_universe(tickers, market, token, workers=4):
-    rows, errors = [], []
-    bar = st.progress(0.0, text="Buscando fundamentos…")
-
-    def job(t):
-        if market == "EUA (yfinance)":
-            return fetch_yf(t)
-        try:
-            return fetch_brapi(t, token)
-        except Exception:
-            if market == "B3 (Brapi)":  # fallback: yfinance com sufixo .SA
-                return fetch_yf(f"{t}.SA")
-            raise
-
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(job, t): t for t in tickers}
-        for i, fut in enumerate(as_completed(futures), 1):
-            t = futures[fut]
-            try:
-                rows.append(fut.result())
-            except Exception as e:
-                errors.append(f"{t}: {type(e).__name__}")
-            bar.progress(i / len(tickers), text=f"Buscando fundamentos… {i}/{len(tickers)}")
-    bar.empty()
-    return pd.DataFrame(rows), errors
-
-
-# ----------------------------------------------------------------------------
-# 3. MOTOR DE PONTUAÇÃO
-# ----------------------------------------------------------------------------
-def compare(value, op, thr):
-    return {"<": value < thr, "<=": value <= thr, ">": value > thr, ">=": value >= thr}[op]
-
-
-def fmt(v, kind):
-    if v is None or pd.isna(v):
+def fmt(c, v):
+    if v is None:
         return "—"
-    if kind == "pct":
-        return f"{v * 100:.2f}%"
-    if kind == "int":
-        return f"{v:,.0f}".replace(",", ".")
-    if kind == "bool":
-        return f"{v:,.0f}".replace(",", ".")
+    if c["kind"] == "pct":
+        return f"{v * 100:.1f}%"
+    if c["kind"] in ("money", "bool"):
+        return money(v)
     return f"{v:.2f}"
 
 
-def score(df, cfg, vol_col, missing_fails, prata_min, bronze_min):
-    active = [c for c in CRITERIA if cfg[c["key"]]["on"]]
-    details, out = {}, []
-    for _, r in df.iterrows():
-        items, ok, failed, nd = [], 0, [], 0
-        for c in active:
-            col = vol_col if c["key"] == "vol" else c["col"]
-            val = r.get(col)
-            thr = cfg[c["key"]]["val"]
-            if c["kind"] == "pct":
-                thr = thr / 100
-            rule = f"{OP_SYMBOL[c['op']]} {fmt(thr, c['kind'])}" if c["kind"] != "bool" else "positivo"
-            if val is None or pd.isna(val):
-                status = "nd"
-            else:
-                passed = compare(val, c["op"], 0 if c["kind"] == "bool" else thr)
-                if c["key"] in ("pl", "pvp") and val <= 0:  # lucro/PL negativo não vale como "barato"
-                    passed = False
-                status = "ok" if passed else "fail"
-            if status == "ok":
-                ok += 1
-            elif status == "fail" or (status == "nd" and missing_fails):
-                failed.append(c["label"])
-            else:
-                nd += 1
-            label = {"ok": "✅ Passou", "fail": "❌ Falhou", "nd": "➖ Sem dado"}[status]
-            items.append((c["label"], rule, fmt(val, c["kind"]), label))
-        evaluated = ok + len(failed)
-        adh = ok / evaluated if evaluated else 0.0
-        if adh >= 0.999999 and evaluated:
-            cat = "Ouro"
-        elif adh >= prata_min:
-            cat = "Prata"
-        elif adh >= bronze_min:
-            cat = "Bronze"
-        else:
-            cat = "Descartada"
-        details[r["Ticker"]] = items
-        out.append({"Ticker": r["Ticker"], "Aderência": adh, "Critérios": f"{ok}/{evaluated}",
-                    "OK": ok, "Avaliados": evaluated, "Falhou em": ", ".join(failed) or "—",
-                    "Categoria": cat})
-    return df.merge(pd.DataFrame(out), on="Ticker"), details
+def rule(c, cfg):
+    return "positivo" if c["kind"] == "bool" else f"{OP[c['op']]} {fmt(c, threshold(c, cfg))}"
 
 
-# ----------------------------------------------------------------------------
-# 4. INTERFACE
-# ----------------------------------------------------------------------------
-def reset_defaults():
-    for c in CRITERIA:
-        st.session_state[f"on_{c['key']}"] = True
-        if c["kind"] != "bool":
-            st.session_state[f"val_{c['key']}"] = c["default"]
+# ------------------------------------------------------------------- dados
+@st.cache_data(ttl=6 * 3600, show_spinner="Carregando todas as ações da B3…")
+def load_bulk():
+    out, status = {}, {}
+    for key, fn in (("fundamentus", fetch_fundamentus), ("statusinvest", fetch_statusinvest)):
+        data, err = fn()
+        status[key] = err
+        if data:
+            out[key] = data
+    return out, status
 
 
-def table_column_config(vol_col):
-    return {
-        "Aderência": st.column_config.NumberColumn(format="%.0f%%"),
-        "Preço": st.column_config.NumberColumn(format="%.2f"),
-        "P/L": st.column_config.NumberColumn(format="%.1f"),
-        "P/VP": st.column_config.NumberColumn(format="%.2f"),
-        "DY": st.column_config.NumberColumn(format="%.1f%%"),
-        "Margem Bruta": st.column_config.NumberColumn(format="%.1f%%"),
-        "Margem Líquida": st.column_config.NumberColumn(format="%.1f%%"),
-        "ROE": st.column_config.NumberColumn(format="%.1f%%"),
-        "Liquidez": st.column_config.NumberColumn(format="%.2f"),
-        "DL/PL": st.column_config.NumberColumn(format="%.2f"),
-        vol_col: st.column_config.NumberColumn(format="%d"),
-    }
+def apply_preset():
+    for k, (on, val) in PRESETS[st.session_state["preset"]].items():
+        st.session_state[f"on_{k}"] = on
+        if k != "fcl":
+            st.session_state[f"val_{k}"] = val
 
 
-def show_category(df, cat, icon, vol_col, details):
-    sub = df[df["Categoria"] == cat].sort_values(["Aderência", "DY"], ascending=False)
-    st.subheader(f"{icon} {cat} ({len(sub)})")
-    if sub.empty:
-        st.caption("Nenhuma ação nesta categoria com os critérios atuais.")
-        return
-    cols = ["Ticker", "Empresa", "Aderência", "Critérios", "Falhou em", "Preço", "P/L", "P/VP", "DY",
-            vol_col, "Margem Bruta", "Margem Líquida", "ROE", "Liquidez", "DL/PL"]
-    view = sub[cols].copy().reset_index(drop=True)
-    for c in PCT_COLS + ["Aderência"]:
-        if c in view:
-            view[c] = view[c] * 100
-    event = st.dataframe(view, hide_index=True, width="stretch", key=f"tbl_{cat}",
-                         on_select="rerun", selection_mode="single-row",
-                         column_config=table_column_config(vol_col))
-    if event.selection.rows:
-        row = view.iloc[event.selection.rows[0]]
-        st.markdown(f"**{row['Ticker']} — {row['Empresa']}** · {row['Critérios']} critérios atendidos")
-        st.progress(float(row["Aderência"]) / 100)
-        st.dataframe(pd.DataFrame(details[row["Ticker"]], columns=["Critério", "Regra", "Valor", "Resultado"]),
-                     hide_index=True, width="stretch")
-    else:
-        st.caption("Clique em uma linha para ver quais critérios a ação passou ou falhou.")
+for _c in CRITERIA:
+    st.session_state.setdefault(f"on_{_c['key']}", True)
+    if _c["kind"] != "bool":
+        st.session_state.setdefault(f"val_{_c['key']}", _c["default"])
+st.session_state.setdefault("extra", {})
 
+bulk, bulk_status = load_bulk()
 
-# ---- Sidebar: universo e opções -------------------------------------------
+# ------------------------------------------------------------------ sidebar
 with st.sidebar:
-    st.header("Universo de ações")
-    market = st.radio("Mercado", list(DEFAULT_UNIVERSES), index=0)
-    try:
-        default_token = st.secrets.get("BRAPI_TOKEN", "")
-    except Exception:
-        default_token = ""
-    token = st.text_input("Token Brapi.dev", type="password",
-                          value=os.getenv("BRAPI_TOKEN", default_token),
-                          help="Gratuito em brapi.dev. Sem token só funcionam alguns tickers de teste.")
-    tickers_txt = st.text_area("Tickers (separados por vírgula)", DEFAULT_UNIVERSES[market], height=160,
-                               key=f"tickers_{market}")
-    st.header("Regras de pontuação")
-    vol_mode = st.radio("Volume diário medido em", ["Financeiro (R$/US$)", "Quantidade de ações"])
-    missing_fails = st.checkbox("Dado ausente conta como falha", value=True,
-                                help="Desmarcado: critérios sem dado saem do cálculo da aderência.")
-    prata_min = st.slider("Prata a partir de (% de aderência)", 50, 99, 80) / 100
-    bronze_min = st.slider("Bronze a partir de (% de aderência)", 10, 90, 50) / 100
-    fetch = st.button("🔄 Buscar / atualizar dados", type="primary")
+    st.header("Critérios")
+    st.selectbox("Perfil", list(PRESETS), key="preset", on_change=apply_preset,
+                 help="Carrega valores prontos. Depois é só mexer nos controles.")
+    for c in CRITERIA:
+        k = c["key"]
+        st.toggle(c["label"], key=f"on_{k}")
+        if c["kind"] == "bool":
+            continue
+        off = not st.session_state[f"on_{k}"]
+        if c["kind"] == "money":
+            st.select_slider("v", options=c["options"], key=f"val_{k}", format_func=money,
+                             disabled=off, label_visibility="collapsed")
+        else:
+            st.slider("v", c["lo"], c["hi"], step=c["step"], key=f"val_{k}", disabled=off,
+                      format="%.1f%%" if c["kind"] == "pct" else "%.2f", label_visibility="collapsed")
+    with st.expander("Regras de classificação"):
+        prata_min = st.slider("Prata a partir de", 50, 99, 80, format="%d%%") / 100
+        bronze_min = st.slider("Bronze a partir de", 10, 90, 50, format="%d%%") / 100
+        missing_fails = st.toggle("Dado ausente conta como falha", value=True,
+                                  help="Desligado: critério sem dado sai do cálculo.")
+    with st.expander("Token da Brapi"):
+        try:
+            secret = st.secrets.get("BRAPI_TOKEN", "")
+        except Exception:  # noqa: BLE001
+            secret = ""
+        token = st.text_input("Token", type="password", value=os.getenv("BRAPI_TOKEN", secret))
+    st.divider()
+    st.caption("Status das fontes em lote")
+    for s in ("fundamentus", "statusinvest"):
+        err = bulk_status.get(s)
+        n = len(bulk.get(s, {}))
+        st.caption(f"{'✅' if s in bulk else '❌'} {SOURCES[s]}: {f'{n} ações' if s in bulk else err}")
+    if st.button("Atualizar todos os dados"):
+        load_bulk.clear()
+        st.session_state["extra"] = {}
+        st.rerun()
 
-st.title("📈 Screener Dinâmico de Ações")
+if not bulk:
+    st.error("Nenhuma fonte em lote respondeu. Veja o motivo na barra lateral e use 'Atualizar todos os dados'.")
+    st.stop()
 
-tab_cfg, tab_res = st.tabs(["⚙️ Configuração de Critérios", "📊 Resultados"])
+# ---------------------------------------------------------------- cálculo
+cfg = {c["key"]: {"on": st.session_state[f"on_{c['key']}"],
+                  "val": st.session_state.get(f"val_{c['key']}", True)} for c in CRITERIA}
+active = [c for c in CRITERIA if cfg[c["key"]]["on"]]
+store = {**bulk, **{s: d for s, d in st.session_state["extra"].items() if d}}
+universe = sorted(set().union(*[set(d) for d in bulk.values()]))
 
-# ---- Aba 1: filtros dinâmicos ---------------------------------------------
-cfg = {}
-with tab_cfg:
-    st.write("Altere os valores e marque quais critérios entram no cálculo. "
-             "Os resultados são recalculados na hora, sem nova consulta à API.")
-    st.button("Restaurar padrões", on_click=reset_defaults)
-    left, right = st.columns(2)
-    for i, c in enumerate(CRITERIA):
-        with (left if i % 2 == 0 else right):
-            box = st.container(border=True)
-            k = c["key"]
-            if c["kind"] == "bool":
-                on = box.checkbox("Exigir fluxo de caixa livre positivo (Sim/Não)", value=True, key=f"on_{k}")
-                cfg[k] = {"on": on, "val": True}
-                continue
-            on = box.checkbox(c["label"], value=True, key=f"on_{k}")
-            fmt_str = "%d" if c["kind"] == "int" else "%.2f"
-            val = box.number_input(c["label"], value=c["default"], step=c["step"], format=fmt_str,
-                                   key=f"val_{k}", disabled=not on, label_visibility="collapsed")
-            cfg[k] = {"on": on, "val": val}
+st.title("📈 Screener de Ações da B3")
+if not active:
+    st.warning("Ligue ao menos um critério na barra lateral.")
+    st.stop()
+if bronze_min > prata_min:
+    st.warning("O corte do Bronze está acima do corte da Prata. Ajuste em 'Regras de classificação'.")
 
-# ---- Coleta ---------------------------------------------------------------
-if fetch:
-    tickers = sorted({t.strip().upper().replace(".SA", "") for t in
-                      tickers_txt.replace("\n", ",").replace(" ", ",").split(",") if t.strip()})
-    if not tickers:
-        st.sidebar.error("Informe ao menos um ticker.")
+scored, details = score_universe(universe, store, cfg, missing_fails, prata_min, bronze_min)
+counts = scored["Categoria"].value_counts()
+
+m = st.columns(5)
+m[0].metric("Ações analisadas", len(scored))
+for col, cat in zip(m[1:], CATEGORIES):
+    col.metric(f"{CAT_ICON[cat]} {cat}", int(counts.get(cat, 0)))
+
+tab_scr, tab_q, tab_info = st.tabs(["📋 Screener", "🧪 Qualidade dos dados", "ℹ️ Fontes e limites"])
+
+# ------------------------------------------------------------- aba screener
+with tab_scr:
+    with st.expander("🔍 Validar candidatos com Yahoo Finance e Brapi (3ª e 4ª fonte)"):
+        st.caption("As duas fontes em lote já são comparadas para todas as ações. Aqui você confirma só os "
+                   "candidatos com mais duas fontes, que também trazem fluxo de caixa livre.")
+        a, b, c3 = st.columns(3)
+        scope = a.selectbox("Validar", ["Ouro", "Ouro + Prata", "Ouro + Prata + Bronze"])
+        n_max = b.slider("Máximo de ações", 5, 60, 25)
+        srcs = c3.multiselect("Fontes", ["yahoo", "brapi"], default=["yahoo", "brapi"], format_func=SOURCES.get)
+        if st.button("Validar agora", type="primary"):
+            cats = CATEGORIES[: ["Ouro", "Ouro + Prata", "Ouro + Prata + Bronze"].index(scope) + 1]
+            cands = scored[scored["Categoria"].isin(cats)].head(n_max)["Ticker"].tolist()
+            jobs = [(s, t) for s in srcs for t in cands if t not in st.session_state["extra"].get(s, {})]
+            if not jobs:
+                st.info("Nada novo para validar.")
+            else:
+                bar = st.progress(0.0, text="Consultando fontes…")
+                got, errs = enrich(jobs, token, on_progress=lambda i, n: bar.progress(i / n))
+                for s, d in got.items():
+                    st.session_state["extra"].setdefault(s, {}).update(d)
+                st.session_state["enrich_errs"] = errs
+                st.rerun()
+        errs = st.session_state.get("enrich_errs") or {}
+        for s, lst in errs.items():
+            st.warning(f"{SOURCES[s]}: {len(lst)} falha(s). Exemplo: {lst[0]}")
+
+    f1, f2 = st.columns([1, 2])
+    query = f1.text_input("Buscar ticker ou empresa", placeholder="ex.: BBAS, taesa")
+    cats_sel = f2.multiselect("Categorias", CATEGORIES, default=["Ouro", "Prata", "Bronze"],
+                              format_func=lambda x: f"{CAT_ICON[x]} {x}")
+    shown = scored[scored["Categoria"].isin(cats_sel)]
+    if query:
+        q = query.strip().lower()
+        shown = shown[shown["Ticker"].str.lower().str.contains(q) | shown["Empresa"].str.lower().str.contains(q)]
+    shown = shown.reset_index(drop=True)
+
+    if shown.empty:
+        st.info("Nenhuma ação com esses filtros. Afrouxe algum critério na barra lateral.")
     else:
-        raw, errs = load_universe(tickers, market, token)
-        st.session_state["raw"], st.session_state["errs"] = raw, errs
+        cols = ["Cat.", "Ticker", "Empresa", "Aderência", "Fontes"] + [c["short"] for c in active]
+        rows, css_rows = [], []
+        for _, r in shown.iterrows():
+            cells = details[r["Ticker"]]
+            row = {"Cat.": CAT_ICON[r["Categoria"]], "Ticker": r["Ticker"], "Empresa": r["Empresa"],
+                   "Aderência": f"{r['OK']}/{r['Avaliados']} · {r['Aderência']:.0%}", "Fontes": r["Fontes"]}
+            cs = {k: "" for k in cols}
+            cs["Aderência"] = CSS["ok"] if r["Categoria"] == "Ouro" else (
+                CSS["fail"] if r["Categoria"] == "Descartada" else CSS["nd"])
+            for c in active:
+                res = cells[c["key"]]
+                row[c["short"]] = "—" if res["status"] == "nd" else f"{ICON[res['status']]} {fmt(c, res['value'])}"
+                cs[c["short"]] = CSS[res["status"]]
+            rows.append(row)
+            css_rows.append(cs)
+        view, css = pd.DataFrame(rows)[cols], pd.DataFrame(css_rows)[cols]
+        st.caption("🟩 passou · 🟥 falhou · 🟨 fontes divergem · ⬜ sem dado. "
+                   "Fontes: F Fundamentus · S Status Invest · Y Yahoo · B Brapi. Clique numa linha para o detalhe.")
+        ev = st.dataframe(view.style.apply(lambda _: css, axis=None), hide_index=True, width="stretch",
+                          height=min(36 * (len(view) + 1) + 3, 620), key="tbl",
+                          on_select="rerun", selection_mode="single-row")
+        pos = ev.selection.rows
+        ticker = shown.iloc[pos[0]]["Ticker"] if pos and pos[0] < len(shown) else None
+        if ticker is None:
+            ticker = st.selectbox("Ou escolha uma ação para detalhar", [None] + shown["Ticker"].tolist())
 
-# ---- Aba 2: resultados ----------------------------------------------------
-with tab_res:
-    raw = st.session_state.get("raw")
-    if raw is None or raw.empty:
-        st.info("Clique em **Buscar / atualizar dados** na barra lateral para carregar os fundamentos.")
-        if st.session_state.get("errs"):
-            st.warning("Falhas: " + "; ".join(st.session_state["errs"]))
-    elif not any(v["on"] for v in cfg.values()):
-        st.warning("Ative ao menos um critério na aba de configuração.")
+        if ticker:
+            r = scored[scored["Ticker"] == ticker].iloc[0]
+            st.subheader(f"{ticker} · {r['Empresa'] or 'sem nome'}")
+            st.progress(float(r["Aderência"]),
+                        text=f"{r['OK']}/{r['Avaliados']} critérios · {CAT_ICON[r['Categoria']]} {r['Categoria']}")
+            drows, dcss = [], []
+            for c in active:
+                res = details[ticker][c["key"]]
+                row = {"Critério": c["label"], "Regra": rule(c, cfg), "Valor adotado": fmt(c, res["value"])}
+                cs = {"Critério": "", "Regra": "", "Valor adotado": "", "Resultado": CSS[res["status"]]}
+                for s, name in SOURCES.items():
+                    v = res["per"].get(s)
+                    row[name] = fmt(c, v) if v is not None else "—"
+                    cs[name] = "" if v is None else CSS["ok" if res["verdicts"][s] else "fail"]
+                row["Resultado"] = LABEL[res["status"]]
+                drows.append(row)
+                dcss.append(cs)
+            dv, dc = pd.DataFrame(drows), pd.DataFrame(dcss)
+            st.dataframe(dv.style.apply(lambda _: dc[dv.columns], axis=None), hide_index=True, width="stretch")
+            if (r["Falhas"] != "—"):
+                st.caption(f"Reprovou ou divergiu em: {r['Falhas']}.")
+
+# ----------------------------------------------------------- aba qualidade
+with tab_q:
+    stats, div = agreement(store)
+    if stats.empty:
+        st.info("Ainda não há dados de pelo menos duas fontes para comparar.")
     else:
-        vol_col = "Volume (R$)" if vol_mode.startswith("Financeiro") else "Volume (ações)"
-        scored, details = score(raw, cfg, vol_col, missing_fails, prata_min, bronze_min)
+        st.write("Quanto cada fonte concorda com as demais. Com 2 fontes a concordância é simétrica; "
+                 "com 3 ou mais (após validar), a fonte que destoa aparece com percentual menor.")
+        stats["ok"] = stats["Comparações"] * stats["Concordância"]
+        tot = stats.groupby("Fonte").agg(Comparações=("Comparações", "sum"), ok=("ok", "sum"))
+        tot["Concordância"] = tot["ok"] / tot["Comparações"]
+        st.dataframe(tot[["Comparações", "Concordância"]], width="stretch",
+                     column_config={"Concordância": st.column_config.ProgressColumn(format="percent", min_value=0, max_value=1)})
+        pv = stats.pivot(index="Fonte", columns="Métrica", values="Concordância").rename(columns=METRIC_NAME)
 
-        counts = scored["Categoria"].value_counts()
-        m = st.columns(4)
-        for col, (cat, icon) in zip(m, [("Ouro", "🥇"), ("Prata", "🥈"), ("Bronze", "🥉"), ("Descartada", "❌")]):
-            col.metric(f"{icon} {cat}", int(counts.get(cat, 0)))
+        def tint(v):
+            if pd.isna(v):
+                return ""
+            return CSS["ok"] if v >= 0.85 else (CSS["div"] if v >= 0.6 else CSS["fail"])
 
-        if st.session_state.get("errs"):
-            with st.expander(f"{len(st.session_state['errs'])} ticker(s) sem dados"):
-                st.write(", ".join(st.session_state["errs"]))
+        st.dataframe(pv.style.format("{:.0%}", na_rep="—").apply(
+            lambda d: pd.DataFrame([[tint(v) for v in row] for row in d.values], index=d.index, columns=d.columns),
+            axis=None), width="stretch")
+        st.subheader("Maiores divergências")
+        if div.empty:
+            st.success("Nenhuma divergência acima da tolerância.")
+        else:
+            d = div.head(60).copy()
+            d["Métrica"] = d["Métrica"].map(METRIC_NAME)
+            d["Desvio"] = d["Desvio"] * 100
+            st.caption("Percentuais em fração (0,10 = 10%). Desvio = (maior − menor) / mediana.")
+            st.dataframe(d, hide_index=True, width="stretch",
+                         column_config={"Desvio": st.column_config.NumberColumn(format="%.0f%%")})
 
-        for cat, icon in [("Ouro", "🥇"), ("Prata", "🥈"), ("Bronze", "🥉")]:
-            show_category(scored, cat, icon, vol_col, details)
-        with st.expander(f"❌ Descartadas / fora do alvo ({int(counts.get('Descartada', 0))})"):
-            show_category(scored, "Descartada", "❌", vol_col, details)
+# ------------------------------------------------------------- aba fontes
+with tab_info:
+    st.markdown("""
+**Fundamentus** · lote (todas as ações) · P/L, P/VP, DY, margem líquida, ROE, liquidez corrente, volume.
+Raspagem de página, sem chave. Não tem margem bruta, dívida líquida nem FCL.
 
-        st.download_button("⬇️ Baixar resultado completo (CSV)",
-                           scored.to_csv(index=False).encode("utf-8-sig"), "screener.csv", "text/csv")
+**Status Invest** · lote (todas as ações) · adiciona margem bruta e dívida líquida/PL.
+Endpoint não oficial: pode mudar ou bloquear acessos de servidores de nuvem. Se falhar, o app segue com as demais.
+
+**Yahoo Finance** (yfinance) · por ticker · tem FCL e dívida. Não oficial; pode limitar o ritmo.
+
+**Brapi** · por ticker · API oficial. No plano gratuito: 1 ação por chamada, 15.000 chamadas/mês, sem dividendos
+e fundamentos básicos. Com token, ajuda a confirmar P/L e preço.
+
+**Como o veredito é decidido.** Cada fonte é comparada com o limite do critério. Se todas concordam, vale esse resultado.
+Com 3 ou mais fontes, a maioria decide. Com divergência sem maioria, o critério fica 🟨 e conta como não atendido.
+
+**Limites.** Concordância entre fontes não prova que o dado está certo: fontes podem copiar o mesmo erro.
+A liquidez usada é a **corrente** (nenhuma fonte gratuita entrega a liquidez imediata).
+Dados atrasados e indicadores de bancos (sem margem bruta) podem aparecer sem dado. Não é recomendação de investimento.
+""")
